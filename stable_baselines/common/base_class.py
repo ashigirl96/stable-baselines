@@ -468,7 +468,7 @@ class SetVerbosity:
 
 
 class TensorboardWriter:
-    def __init__(self, graph, tensorboard_log_path, tb_log_name):
+    def __init__(self, graph, tensorboard_log_path, tb_log_name) -> None:
         """
         Create a Tensorboard writer for a code segment, and saves it to the log directory as its own run
 
@@ -481,7 +481,7 @@ class TensorboardWriter:
         self.tb_log_name = tb_log_name
         self.writer = None
 
-    def __enter__(self):
+    def __enter__(self) -> tf.summary.FileWriter:
         if self.tensorboard_log_path is not None:
             save_path = os.path.join(self.tensorboard_log_path,
                                      "{}_{}".format(self.tb_log_name, self._get_latest_run_id() + 1))
