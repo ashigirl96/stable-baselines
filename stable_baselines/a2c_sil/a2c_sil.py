@@ -3,6 +3,7 @@ import time
 import gym
 import numpy as np
 import tensorflow as tf
+from pathlib import Path
 
 from stable_baselines import logger
 from stable_baselines.common import explained_variance, tf_util, ActorCriticRLModel, SetVerbosity, TensorboardWriter
@@ -11,10 +12,12 @@ from stable_baselines.common.runners import AbstractEnvRunner
 from stable_baselines.a2c.utils import discount_with_dones, Scheduler, find_trainable_variables, mse, \
     total_episode_reward_logger
 
+from stable_baselines.common.self_imitation import SelfImitation
 
-class A2C(ActorCriticRLModel):
+
+class SelfImitationA2C(ActorCriticRLModel):
     """
-    The A2C (Advantage Actor Critic) model class, https://arxiv.org/abs/1602.01783
+    The SelfImitationA2C (Advantage Actor Critic) model class, https://arxiv.org/abs/1602.01783
 
     :param policy: (ActorCriticPolicy or str) The policy model to use (MlpPolicy, CnnPolicy, CnnLstmPolicy, ...)
     :param env: (Gym environment or str) The environment to learn from (if registered in Gym, can be str)
@@ -38,10 +41,13 @@ class A2C(ActorCriticRLModel):
 
     def __init__(self, policy, env, gamma=0.99, n_steps=5, vf_coef=0.25, ent_coef=0.01, max_grad_norm=0.5,
                  learning_rate=7e-4, alpha=0.99, epsilon=1e-5, lr_schedule='linear', verbose=0, tensorboard_log=None,
-                 _init_setup_model=True):
+                 _init_setup_model=True, sil_update=4, sil_beta=0):
 
-        super(A2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
-                                  _init_setup_model=_init_setup_model)
+        super(SelfImitationA2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
+                                               _init_setup_model=_init_setup_model)
+
+        self.sil_update = sil_update
+        self.sil_beta = sil_beta
 
         self.n_steps = n_steps
         self.gamma = gamma
@@ -75,6 +81,7 @@ class A2C(ActorCriticRLModel):
         self.learning_rate_schedule = None
         self.summary = None
         self.episode_reward = None
+        self.saver: tf.train.Saver = None
 
         # if we are loading, it is possible the environment is not known, however the obs and action space are known
         if _init_setup_model:
@@ -84,7 +91,7 @@ class A2C(ActorCriticRLModel):
         with SetVerbosity(self.verbose):
 
             assert issubclass(self.policy, ActorCriticPolicy), "Error: the input policy for the A2C model must be an " \
-                                                                "instance of common.policies.ActorCriticPolicy."
+                                                               "instance of common.policies.ActorCriticPolicy."
 
             self.graph = tf.Graph()
             with self.graph.as_default():
@@ -94,17 +101,26 @@ class A2C(ActorCriticRLModel):
 
                 n_batch_step = None
                 n_batch_train = None
+                n_batch_sil = None
                 if issubclass(self.policy, LstmPolicy):
                     n_batch_step = self.n_envs
                     n_batch_train = self.n_envs * self.n_steps
+                    # TODO: Add
+                    n_batch_sil = 512
 
                 step_model = self.policy(self.sess, self.observation_space, self.action_space, self.n_envs, 1,
                                          n_batch_step, reuse=False)
 
+                # TODO: Add
                 with tf.variable_scope("train_model", reuse=True,
                                        custom_getter=tf_util.outer_scope_getter("train_model")):
                     train_model = self.policy(self.sess, self.observation_space, self.action_space, self.n_envs,
                                               self.n_steps, n_batch_train, reuse=True)
+
+                with tf.variable_scope("sil_model", reuse=True,
+                                       custom_getter=tf_util.outer_scope_getter("sil_model")):
+                    sil_model = self.policy(self.sess, self.observation_space, self.action_space,
+                                            self.n_envs, self.n_steps, n_batch_sil, reuse=True)
 
                 with tf.variable_scope("loss", reuse=False):
                     self.actions_ph = train_model.pdtype.sample_placeholder([None], name="action_ph")
@@ -145,6 +161,25 @@ class A2C(ActorCriticRLModel):
                                                     epsilon=self.epsilon)
                 self.apply_backprop = trainer.apply_gradients(grads)
 
+                # TODO: Add
+                self.sil = SelfImitation(
+                    model_ob=sil_model.obs_ph,
+                    model_vf=sil_model.value_fn,
+                    model_entropy=sil_model.proba_distribution.entropy(),
+                    fn_value=sil_model.value,
+                    fn_neg_log_prob=sil_model.proba_distribution.neglogp,
+                    ac_space=self.action_space,
+                    fn_reward=np.sign,
+                    n_env=self.n_envs,
+                    n_update=self.sil_update,
+                    beta=self.sil_beta)
+
+                self.sil.build_train_op(
+                    params=self.params,
+                    optim=trainer,
+                    lr=self.learning_rate_ph,
+                    max_grad_norm=self.max_grad_norm)
+
                 self.train_model = train_model
                 self.step_model = step_model
                 self.step = step_model.step
@@ -154,8 +189,9 @@ class A2C(ActorCriticRLModel):
                 tf.global_variables_initializer().run(session=self.sess)
 
                 self.summary = tf.summary.merge_all()
+                self.saver = tf.train.Saver()
 
-    def _train_step(self, obs, states, rewards, masks, actions, values, update, writer=None):
+    def _train_step(self, obs, states, rewards, masks, actions, values, update, writer: tf.summary.FileWriter = None):
         """
         applies a training step to the model
 
@@ -201,22 +237,28 @@ class A2C(ActorCriticRLModel):
 
         return policy_loss, value_loss, policy_entropy
 
-    def learn(self, total_timesteps, callback=None, seed=None, log_interval=100, tb_log_name="A2C"):
-        with SetVerbosity(self.verbose), TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name) as writer:
+    def _train_sil(self):
+        cur_lr = self.learning_rate_schedule.value()
+        return self.sil.train(self.sess, cur_lr)
+
+    def learn(self, total_timesteps, callback=None, seed=None, log_interval=100, tb_log_name="SIL_A2C"):
+        with SetVerbosity(self.verbose), \
+             TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name) as writer:  # type: tf.summary.FileWriter
             self._setup_learn(seed)
 
             self.learning_rate_schedule = Scheduler(initial_value=self.learning_rate, n_values=total_timesteps,
                                                     schedule=self.lr_schedule)
 
-            runner = A2CRunner(self.env, self, n_steps=self.n_steps, gamma=self.gamma)
+            runner = SelfImitationA2CRunner(self.env, self, n_steps=self.n_steps, gamma=self.gamma)
             self.episode_reward = np.zeros((self.n_envs,))
 
             t_start = time.time()
             for update in range(1, total_timesteps // self.n_batch + 1):
                 # true_reward is the reward without discount
-                obs, states, rewards, masks, actions, values, true_reward = runner.run()
+                obs, states, rewards, masks, actions, values, true_reward, raw_rewards = runner.run()
                 _, value_loss, policy_entropy = self._train_step(obs, states, rewards, masks, actions, values, update,
                                                                  writer)
+                sil_loss, sil_adv, sil_samples, sil_nlogp = self._train_sil()
                 n_seconds = time.time() - t_start
                 fps = int((update * self.n_batch) / n_seconds)
 
@@ -237,7 +279,20 @@ class A2C(ActorCriticRLModel):
                     logger.record_tabular("policy_entropy", float(policy_entropy))
                     logger.record_tabular("value_loss", float(value_loss))
                     logger.record_tabular("explained_variance", float(explained_var))
+                    logger.record_tabular("best_episode_reward", float(self.sil.get_best_reward()))
+                    if self.sil_update > 0:
+                        logger.record_tabular("sil_num_episodes", float(self.sil.num_episodes()))
+                        logger.record_tabular("sil_valid_samples", float(sil_samples))
+                        logger.record_tabular("sil_steps", float(self.sil.num_steps()))
                     logger.dump_tabular()
+
+                if (update % (log_interval * 10) == 0 or update == 1):
+                    start_time = time.time()
+                    save_path_dir = Path(writer.get_logdir())
+                    save_path = save_path_dir.joinpath('variables.ckpt').as_posix()
+                    self.saver.save(self.sess, save_path)
+                    duration = time.time() - start_time
+                    logger.info('saving time {}'.format(duration))
 
         return self
 
@@ -265,8 +320,11 @@ class A2C(ActorCriticRLModel):
         self._save_to_file(save_path, data=data, params=params)
 
 
-class A2CRunner(AbstractEnvRunner):
-    def __init__(self, env, model, n_steps=5, gamma=0.99):
+class SelfImitationA2CRunner(AbstractEnvRunner):
+    def __init__(self,
+                 env,
+                 model: SelfImitationA2C,
+                 n_steps=5, gamma=0.99):
         """
         A runner to learn the policy of an environment for an a2c model
 
@@ -275,7 +333,8 @@ class A2CRunner(AbstractEnvRunner):
         :param n_steps: (int) The number of steps to run for each environment
         :param gamma: (float) Discount factor
         """
-        super(A2CRunner, self).__init__(env=env, model=model, n_steps=n_steps)
+        super(SelfImitationA2CRunner, self).__init__(env=env, model=model, n_steps=n_steps)
+        self.model = model
         self.gamma = gamma
 
     def run(self):
@@ -286,6 +345,8 @@ class A2CRunner(AbstractEnvRunner):
                  observations, states, rewards, masks, actions, values
         """
         mb_obs, mb_rewards, mb_actions, mb_values, mb_dones = [], [], [], [], []
+        # TODO: add
+        mb_raw_rewards = []
         mb_states = self.states
         for _ in range(self.n_steps):
             actions, values, states, _ = self.model.step(self.obs, self.states, self.dones)
@@ -297,9 +358,16 @@ class A2CRunner(AbstractEnvRunner):
             # Clip the actions to avoid out of bound error
             if isinstance(self.env.action_space, gym.spaces.Box):
                 clipped_actions = np.clip(actions, self.env.action_space.low, self.env.action_space.high)
-            obs, rewards, dones, _ = self.env.step(clipped_actions)
+            # obs, rewards, dones, _ = self.env.step(clipped_actions)
+            obs, raw_rewards, dones, _ = self.env.step(clipped_actions)
+            mb_raw_rewards.append(raw_rewards)
+            rewards = np.sign(raw_rewards)
             self.states = states
             self.dones = dones
+            if hasattr(self.model, 'sil'):
+                self.model.sil.step(self.obs, actions, raw_rewards, dones)
+            else:
+                raise ValueError('Model doesnot have SIL module.')
             self.obs = obs
             mb_rewards.append(rewards)
         mb_dones.append(self.dones)
@@ -309,6 +377,7 @@ class A2CRunner(AbstractEnvRunner):
         mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(0, 1)
         mb_values = np.asarray(mb_values, dtype=np.float32).swapaxes(0, 1)
         mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(0, 1)
+        mb_raw_rewards = np.asarray(mb_raw_rewards, dtype=np.float32).swapaxes(0, 1)
         mb_masks = mb_dones[:, :-1]
         mb_dones = mb_dones[:, 1:]
         true_rewards = np.copy(mb_rewards)
@@ -328,4 +397,4 @@ class A2CRunner(AbstractEnvRunner):
         mb_actions = mb_actions.reshape(-1, *mb_actions.shape[2:])
         mb_values = mb_values.reshape(-1, *mb_values.shape[2:])
         mb_masks = mb_masks.reshape(-1, *mb_masks.shape[2:])
-        return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values, true_rewards
+        return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values, true_rewards, mb_raw_rewards
