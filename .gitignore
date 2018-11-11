@@ -39,3 +39,5 @@ src
 .cache
 
 MUJOCO_LOG.TXT
+
+.commit_template

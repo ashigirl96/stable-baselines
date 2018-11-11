@@ -9,6 +9,7 @@ from pathlib import Path
 
 from stable_baselines.common.cmd_util import make_atari_env, atari_arg_parser
 from stable_baselines.common.vec_env.vec_frame_stack import VecFrameStack
+from tqdm import tqdm
 
 LOG_DIR = Path('tf_log')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,7 +51,7 @@ def main():
       pdtype = make_proba_dist_type(env.action_space)
       actions_ph = pdtype.sample_placeholder([num_env], name="action_ph")
       one_hot_actions = tf.one_hot(actions_ph, env.action_space.n)
-      
+
     print(input_x, process_x)
     print('action', actions_ph, one_hot_actions)
 
@@ -85,14 +86,20 @@ def main():
     sess.run(tf.global_variables_initializer())
 
     observ = env.reset()
-    actions = [env.action_space.sample() for _ in range(num_env)]
-    print(env.observation_space)
-    print(observ.shape)
+    for step in tqdm(range(1, 200_000 + 1)):
+      actions = [env.action_space.sample() for _ in range(num_env)]
+      next_observ, rewards, terminals, _ = env.step(actions)
 
-    recons_image, summary_ = sess.run([recons_x, summary],
-                                      feed_dict={input_x: observ,
-                                                 actions_ph: actions})
-    writer.add_summary(summary_, 0)
+      feed_dict = {input_x: observ,
+                   actions_ph: actions}
+      if step % 2000 == 0:
+        summary_, _ = sess.run([summary, train_op], feed_dict=feed_dict)
+
+        writer.add_summary(summary_, step)
+      else:
+        _ = sess.run([train_op], feed_dict=feed_dict)
+
+      observ = next_observ
 
 
 if __name__ == '__main__':
