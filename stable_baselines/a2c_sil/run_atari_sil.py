@@ -30,11 +30,12 @@ def train(env_id, num_timesteps, seed, policy, lr_schedule, num_env,
     if policy_fn is None:
         raise ValueError("Error: policy {} not implemented".format(policy))
 
-    env = VecFrameStack(make_atari_env(env_id, num_env, seed), 4)
+    env_args = {'episode_life': False, 'clip_rewards': False}
+    env = VecFrameStack(make_atari_env(env_id, num_env, seed, wrapper_kwargs=env_args), 4)
 
     model = SelfImitationA2C(policy_fn, env, lr_schedule=lr_schedule, tensorboard_log='./tf_log', verbose=1,
                              sil_update=sil_update, sil_beta=sil_beta)
-    model.learn(total_timesteps=int(num_timesteps * 1.1), seed=seed, tb_log_name="SIL_A2C")
+    model.learn(total_timesteps=int(num_timesteps * 1.1), seed=seed, tb_log_name="SIL_A2C_Montezuma")
     env.close()
 
 
