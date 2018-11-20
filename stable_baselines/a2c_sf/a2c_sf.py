@@ -4,20 +4,23 @@ import gym
 import numpy as np
 import tensorflow as tf
 from typing import Union, Type
+from pathlib import Path
 
 from stable_baselines import logger
+from stable_baselines.common.self_imitation import SelfImitation
 from stable_baselines.common import explained_variance, tf_util, ActorCriticRLModel, SetVerbosity, TensorboardWriter
-from stable_baselines.common.policies import LstmPolicy, ActorCriticPolicy, CnnLnLstmPolicy, CnnLstmPolicy, CnnPolicy
+from stable_baselines.common.policies import LstmPolicy, ActorCriticPolicy, CnnLnLstmPolicy, CnnLstmPolicy
+from stable_baselines.common.sf_policies import CnnPolicy
+from stable_baselines.common.sf_policies import FeedForwardPolicy
 from stable_baselines.common.runners import AbstractEnvRunner
 from stable_baselines.a2c.utils import discount_with_dones, Scheduler, find_trainable_variables, mse, \
   total_episode_reward_logger
 
-from stable_baselines.common.self_imitation import SelfImitation
 
 Policies = Type[Union[CnnPolicy, CnnLstmPolicy, CnnLnLstmPolicy]]
 
 
-class SelfImitationA2C(ActorCriticRLModel):
+class SuccessorFeatureA2C(ActorCriticRLModel):
   """
   The SelfImitationA2C (Advantage Actor Critic) model class, https://arxiv.org/abs/1602.01783
 
@@ -46,7 +49,7 @@ class SelfImitationA2C(ActorCriticRLModel):
                learning_rate=7e-4, alpha=0.99, epsilon=1e-5, lr_schedule='linear', verbose=0, tensorboard_log=None,
                _init_setup_model=True, sil_update=4, sil_beta=0):
     self.policy: Policies = None
-    super(SelfImitationA2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
+    super(SuccessorFeatureA2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
                                            _init_setup_model=_init_setup_model)
 
     self.sil_update = sil_update
@@ -95,6 +98,8 @@ class SelfImitationA2C(ActorCriticRLModel):
 
       assert issubclass(self.policy, ActorCriticPolicy), "Error: the input policy for the A2C model must be an " \
                                                          "instance of common.policies.ActorCriticPolicy."
+      assert issubclass(self.policy, FeedForwardPolicy), "Error: the input policy for the A2C model must be an " \
+                                                         "instance of common.policies.FeedFowardPolicy."
 
       self.graph = tf.Graph()
       with self.graph.as_default():
@@ -156,6 +161,7 @@ class SelfImitationA2C(ActorCriticRLModel):
           tf.summary.histogram('learning_rate', self.learning_rate)
           tf.summary.scalar('advantage', tf.reduce_mean(self.advs_ph))
           tf.summary.histogram('advantage', self.advs_ph)
+          tf.summary.image('reconstruction',  tf.reshape(train_model.recons_mod, [-1, 84, 84, 1]))
           if len(self.observation_space.shape) == 3:
             tf.summary.image('observation', train_model.obs_ph)
           else:
@@ -252,7 +258,7 @@ class SelfImitationA2C(ActorCriticRLModel):
       self.learning_rate_schedule = Scheduler(initial_value=self.learning_rate, n_values=total_timesteps,
                                               schedule=self.lr_schedule)
 
-      runner = SelfImitationA2CRunner(self.env, self, n_steps=self.n_steps, gamma=self.gamma)
+      runner = SuccessorFeatureA2CRunner(self.env, self, n_steps=self.n_steps, gamma=self.gamma)
       self.episode_reward = np.zeros((self.n_envs,))
 
       t_start = time.time()
@@ -324,10 +330,10 @@ class SelfImitationA2C(ActorCriticRLModel):
     pass
 
 
-class SelfImitationA2CRunner(AbstractEnvRunner):
+class SuccessorFeatureA2CRunner(AbstractEnvRunner):
   def __init__(self,
                env,
-               model: SelfImitationA2C,
+               model: SuccessorFeatureA2C,
                n_steps=5, gamma=0.99):
     """
     A runner to learn the policy of an environment for an a2c model
@@ -337,7 +343,7 @@ class SelfImitationA2CRunner(AbstractEnvRunner):
     :param n_steps: (int) The number of steps to run for each environment
     :param gamma: (float) Discount factor
     """
-    super(SelfImitationA2CRunner, self).__init__(env=env, model=model, n_steps=n_steps)
+    super(SuccessorFeatureA2CRunner, self).__init__(env=env, model=model, n_steps=n_steps)
     self.model = model
     self.gamma = gamma
 

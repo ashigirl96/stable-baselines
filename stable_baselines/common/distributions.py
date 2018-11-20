@@ -143,7 +143,7 @@ class ProbabilityDistributionType(object):
         """
         return tf.placeholder(dtype=tf.float32, shape=prepend_shape + self.param_shape(), name=name)
 
-    def sample_placeholder(self, prepend_shape, name=None):
+    def sample_placeholder(self, prepend_shape, name=None) -> tf.Tensor:
         """
         returns the TensorFlow placeholder for the sampling
 
