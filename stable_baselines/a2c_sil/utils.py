@@ -1,5 +1,6 @@
 import os
 from collections import deque
+from typing import List
 
 import numpy as np
 import tensorflow as tf
@@ -298,7 +299,7 @@ def discount_with_dones(rewards, dones, gamma):
   return discounted[::-1]
 
 
-def find_trainable_variables(key):
+def find_trainable_variables(key) -> List[tf.Variable]:
   """
   Returns the trainable variables within a given scope
 

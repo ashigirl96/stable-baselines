@@ -18,8 +18,8 @@ import numpy as np
 ObservSpace = Union[spaces.Discrete, spaces.Box]
 ActionSpace = Union[spaces.Discrete, spaces.Box]
 
-PROPERTY = 'Pacman_Scale_gamma750'
-LOG_DIR = Path('tf_log/2M') / PROPERTY
+PROPERTY = 'pacman_nonscale_noActiv_recons'
+LOG_DIR = Path('tf_log/vae') / PROPERTY
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -55,13 +55,11 @@ class ReconstructionModule(object):
   def __init__(self, sess: tf.Session,
                observation_space: ObservSpace,
                action_space: ActionSpace,
-               num_batch: int,
-               use_batch_norm=True):
+               num_batch: int):
     self._sess = sess
     self._observ_space = observation_space
     self._action_space = action_space
     self._num_batch = num_batch
-    self._use_batch_norm = use_batch_norm
 
     self._setup_input()
     self.mu, self.log_sigma_sq, self.recons_x = self._build_network(self.process_x,
@@ -83,8 +81,7 @@ class ReconstructionModule(object):
     # Encoding
     with tf.variable_scope('model', reuse=reuse):
       mu, log_sigma_sq = encode_cnn(observ, is_training=is_training, reuse=reuse,
-                                    num_batch=self._num_batch,
-                                    use_batch_norm=self._use_batch_norm)
+                                    num_batch=self._num_batch)
 
       # Sampling
       with tf.name_scope('Sampling'):
@@ -96,17 +93,14 @@ class ReconstructionModule(object):
 
       # Decoding
       recons_x = decode_cnn(z, onehot_action, is_training=is_training, reuse=reuse,
-                            num_batch=self._num_batch,
-                            use_batch_norm=self._use_batch_norm)
+                            num_batch=self._num_batch)
       return z, log_sigma_sq, recons_x
 
 
 def main():
-  beta = 750
+  beta = 0
 
-  # env_id = 'PongNoFrameskip-v4'
   env_id = 'MsPacmanNoFrameskip-v4'
-  # env_id = 'BreakoutNoFrameskip-v4'
   num_env = 16
   num_steps = 5
   num_batch = num_env * num_steps
@@ -121,7 +115,7 @@ def main():
     policy = ReconstructionModule(sess,
                                   env.observation_space,
                                   env.action_space,
-                                  num_batch, use_batch_norm=True)
+                                  num_batch)
 
     def save(save_path: Path, params):
       data = {
@@ -148,31 +142,18 @@ def main():
       recons_losses = tf.squared_difference(policy.next_process_x,
                                             policy.recons_x)
       recons_loss = tf.reduce_mean(recons_losses, name='reconstruction_loss')
-      kl_divergences = -0.5 * (tf.add(1., policy.log_sigma_sq) - tf.square(policy.mu) - tf.exp(policy.log_sigma_sq))
-      kl_divergence = tf.reduce_mean(kl_divergences, name='kl_divergence')
-      coefed_kl = tf.multiply(tf.abs(kl_divergence - policy.capacity_ph), beta)
-      loss = tf.add(recons_loss, coefed_kl, name='objective')
-      # loss = tf.add(recons_loss,
-      #               tf.multiply(
-      #                 kl_divergence, beta), name='objective')
 
     summary = utility.summary({
-      loss: 'loss',
       policy.capacity_ph: 'capacity',
-      kl_divergences: 'kl_divergences',
       recons_losses: 'recons_losses',
       policy.process_x: 'process_x',
       policy.next_process_x: 'next_process_x',
-      policy.mu: 'phi_mu',
-      policy.log_sigma_sq: 'log_sigma_sq',
       policy.recons_x: 'recons_x',
-      coefed_kl: 'coefed_KL',
-
     }, env.observation_space.shape,
       ignore=['recons_x', 'recons_losses', 'process_x'])
-    optimizer = tf.train.RMSPropOptimizer(learning_rate=7e-4, decay=0.99, epsilon=1e-5)
-    # optimizer = tf.train.AdamOptimizer(5e-5)
-    train_op = optimizer.minimize(loss)
+    # optimizer = tf.train.RMSPropOptimizer(learning_rate=7e-4, decay=0.99, epsilon=1e-5)
+    optimizer = tf.train.AdamOptimizer(5e-4)
+    train_op = optimizer.minimize(recons_loss)
 
     for event_file in LOG_DIR.glob('event*'):
       event_file.unlink()
@@ -184,7 +165,11 @@ def main():
     next_observs = []
 
     observ = env.reset()
-    for step in tqdm(range(1, 2_000_000 + 1, num_env)):
+    global_step = 0
+    while True:
+      if global_step > 100_000:
+        break
+      print('\rStep Global Step {}/{}'.format(global_step, 100_000 + 1), end='', flush=True)
       action = [env.action_space.sample() for _ in range(num_env)]
       next_observ, rewards, terminals, _ = env.step(action)
 
@@ -193,6 +178,7 @@ def main():
       next_observs.extend(next_observ)
 
       observ = next_observ
+      global_step += num_env
 
       if len(observs) == num_batch:
         feed_dict = {policy.input_x: np.asarray(observs),
@@ -200,9 +186,10 @@ def main():
                      policy.actions_ph: np.asarray(actions),
                      policy.capacity_ph: _calculate_encoding_capacity(step),
                      }
-        if (step // num_env + 1) % 1000 == 0:
+        if global_step % (5 * num_batch) == 0:
           summary_, _ = sess.run([summary, train_op], feed_dict=feed_dict)
-          writer.add_summary(summary_, step)
+
+          writer.add_summary(summary_, global_step)
         else:
           _ = sess.run([train_op], feed_dict=feed_dict)
 

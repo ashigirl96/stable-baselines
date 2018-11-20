@@ -189,7 +189,6 @@ class SelfImitationA2C(ActorCriticRLModel):
         tf.global_variables_initializer().run(session=self.sess)
 
         self.summary = tf.summary.merge_all()
-        self.saver = tf.train.Saver()
 
   def _train_step(self, obs, states, rewards, masks, actions, values, update, writer: tf.summary.FileWriter = None):
     """
@@ -289,13 +288,8 @@ class SelfImitationA2C(ActorCriticRLModel):
             logger.record_tabular("sil_steps", float(self.sil.num_steps()))
           logger.dump_tabular()
 
-        if (update % (log_interval * 10) == 0 or update == 1):
-          start_time = time.time()
-          save_path_dir = Path(writer.get_logdir())
-          save_path = save_path_dir.joinpath('variables.ckpt').as_posix()
-          self.saver.save(self.sess, save_path)
-          duration = time.time() - start_time
-          logger.info('saving time {}'.format(duration))
+        if update % (log_interval * 20) == 0:
+          self.save(writer.get_logdir())
 
     return self
 
@@ -322,6 +316,9 @@ class SelfImitationA2C(ActorCriticRLModel):
 
     self._save_to_file(save_path, data=data, params=params)
 
+
+  def load_weights(self, load_path):
+    pass
 
 class SelfImitationA2CRunner(AbstractEnvRunner):
   def __init__(self,

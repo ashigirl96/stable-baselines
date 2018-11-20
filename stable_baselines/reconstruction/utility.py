@@ -8,6 +8,7 @@ def summary(tensor_collection,
             observation_shape,
             summary_type=SUMMARY_TYPE,
             scope=None,
+            ignore=[],
             ) -> tf.summary.Summary:
   """Summary.
   Usage:
@@ -27,10 +28,7 @@ def summary(tensor_collection,
     summaries = []
     if len(tensor.shape) == 0:
       summaries.append(tf.summary.scalar(name, tensor))
-    elif len(tensor.shape) == 4:
-      print('image {}, {}'.format(name, tensor))
-      summaries.append(tf.summary.image(name + '/image', tensor))
-    else:
+    if 0 < len(tensor.shape) < 4 or name in ignore:
       if 'mean' in summary_type:
         mean = tf.reduce_mean(tensor)
         summaries.append(tf.summary.scalar(name + '/mean', mean))
@@ -46,6 +44,11 @@ def summary(tensor_collection,
         summaries.append(tf.summary.scalar(name + '/sparsity', tf.nn.zero_fraction(tensor)))
       if 'histogram' in summary_type:
         summaries.append(tf.summary.histogram(name, tensor))
+    if len(tensor.shape) == 4:
+      print('image {}, {}'.format(name, tensor))
+      summaries.append(tf.summary.image(name + '/image', tensor))
+    if name == 'recons_losses':
+      print('recons_losses', summaries)
     return tf.summary.merge(summaries)
 
   if not isinstance(tensor_collection, (list, tuple, dict)):
