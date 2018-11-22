@@ -43,7 +43,7 @@ class BasePolicy(ABC):
   :param add_action_ph: (bool) whether or not to create an action placeholder
   """
 
-  def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, scale=False,
+  def __init__(self, sess: tf.Session, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, scale=False,
                obs_phs=None, add_action_ph=False):
     self.n_env = n_env
     self.n_steps = n_steps

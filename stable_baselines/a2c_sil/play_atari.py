@@ -4,20 +4,15 @@ from stable_baselines import logger
 from stable_baselines.common.cmd_util import make_video_atari_env, atari_arg_parser
 from stable_baselines.common.vec_env.vec_frame_stack import VecFrameStack
 from stable_baselines.a2c_sil import SelfImitationA2C
-from stable_baselines.common.policies import CnnPolicy, CnnLstmPolicy, CnnLnLstmPolicy
+# from stable_baselines.common.policies import CnnPolicy, CnnLstmPolicy, CnnLnLstmPolicy
+from stable_baselines.common.sf_policies import CnnPolicy
 import numpy as np
 from pathlib import Path
 
 
 def play(env_id, num_timesteps, seed, policy, lr_schedule, num_env,
          sil_update, sil_beta, load_path):
-  policy_fn = None
-  if policy == 'cnn':
-    policy_fn = CnnPolicy
-  elif policy == 'lstm':
-    policy_fn = CnnLstmPolicy
-  elif policy == 'lnlstm':
-    policy_fn = CnnLnLstmPolicy
+  policy_fn = CnnPolicy
   if policy_fn is None:
     raise ValueError("Error: policy {} not implemented".format(policy))
 
