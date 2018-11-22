@@ -1,121 +1,62 @@
+from abc import ABC
 from typing import Tuple
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.contrib import slim
-import functools
-from stable_baselines.a2c_sil.utils import conv_to_fc, linear
+from gym.spaces import Discrete
+
+from stable_baselines.a2c.utils import conv, linear, conv_to_fc, batch_to_seq, \
+    seq_to_batch, lstm, conv_bn_lrelu, dconv_bn_relu, dconv
+from stable_baselines.common.distributions import make_proba_dist_type
+from stable_baselines.common.input import observation_input
 
 
-def encode_cnn(scaled_images, is_training=True, reuse=False, num_batch=None,
-               use_batch_norm=True, **kwargs) -> Tuple[tf.Tensor, tf.Tensor]:
-  """
-  CNN from Count based with Successor Feature paper.
-  :param scaled_images: (TensorFlow Tensor) Image input placeholder
-  :param kwargs: (dict) Extra keywords parameters for the convolutional layers of the CNN
-  :return: (TensorFlow Tensor) The CNN output layer
-  """
-  # None, 84, 84, 4
-  assert scaled_images.shape.as_list() == [num_batch, 84, 84, 4], scaled_images.shape
 
-  batch_norm_fn = None
-  if use_batch_norm:
-    batch_norm_fn = functools.partial(slim.batch_norm,
-                                      scale=True,
-                                      updates_collections=None,
-                                      is_training=is_training)
-  weights_initializer = tf.initializers.orthogonal(np.sqrt(2))
+def encode_cnn(scaled_images, **kwargs) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    CNN from Count based with Successor Feature paper.
+    :param scaled_images: (TensorFlow Tensor) Image input placeholder
+    :param kwargs: (dict) Extra keywords parameters for the convolutional layers of the CNN
+    :return: (TensorFlow Tensor) The CNN output layer
+    """
+    # None, 84, 84, 4
+    assert scaled_images.shape.as_list() == [None, 84, 84, 4]
+    layer_1 = conv_bn_lrelu(scaled_images, 'c1', n_filters=64,
+                            filter_size=6, stride=2, init_scale=np.sqrt(2))  # None, 40, 40, 64
+    assert layer_1.shape.as_list() == [None, 40, 40, 64], layer_1.shape
+    layer_2 = conv_bn_lrelu(layer_1, 'c2', n_filters=64,
+                            filter_size=6, stride=2, init_scale=np.sqrt(2), pad='same')  # None, 20, 20, 64
+    assert layer_2.shape.as_list() == [None, 20, 20, 64], layer_2.shape
+    layer_3 = conv_bn_lrelu(layer_2, 'c3', n_filters=64,
+                            filter_size=6, stride=2, init_scale=np.sqrt(2), pad='same')  # None, 10, 10, 64
+    assert layer_3.shape.as_list() == [None, 10, 10, 64]
+    layer_3 = conv_to_fc(layer_3)  # None, 10 * 10 * 64
+    assert layer_3.shape.as_list() == [None, 10 * 10 * 64]
+    phi_mu = linear(layer_3, 'z_mu', n_hidden=1024, init_scale=np.sqrt(2))  # None, 1024
+    phi_log_sigma_sq = linear(layer_3, 'z_log_sigma_sq', n_hidden=1024, init_scale=np.sqrt(2))  # None, 1024
 
-  with tf.variable_scope('encode', reuse=reuse):
-    x = slim.conv2d(scaled_images, 64, 6, 2,
-                    'valid',
-                    activation_fn=tf.nn.leaky_relu,
-                    normalizer_fn=batch_norm_fn,
-                    weights_initializer=weights_initializer,
-                    scope='conv1')
-
-    assert x.shape.as_list() == [num_batch, 40, 40, 64], x.shape
-
-    x = slim.conv2d(x, 64, 6, 2,
-                    'same',
-                    activation_fn=tf.nn.leaky_relu,
-                    normalizer_fn=batch_norm_fn,
-                    weights_initializer=weights_initializer,
-                    scope='conv2')
-    assert x.shape.as_list() == [num_batch, 20, 20, 64], x.shape
-
-    x = slim.conv2d(x, 64, 6, 2,
-                    'same',
-                    activation_fn=tf.nn.leaky_relu,
-                    normalizer_fn=batch_norm_fn,
-                    weights_initializer=weights_initializer,
-                    scope='conv3')
-    assert x.shape.as_list() == [num_batch, 10, 10, 64], x.shape
-
-    x = conv_to_fc(x)
-    assert x.shape.as_list() == [num_batch, 10 * 10 * 64], x.shape
-
-    phi_mu = tf.layers.dense(x, 1024,
-                             kernel_initializer=weights_initializer,
-                             name='phi_mu')
-    phi_sigma_sq = tf.layers.dense(x, 1024,
-                                   kernel_initializer=weights_initializer,
-                                   name='phi_sigma_sq')
-  return phi_mu, phi_sigma_sq
+    return phi_mu, phi_log_sigma_sq
 
 
-def decode_cnn(hidden: tf.Tensor, action_ph, is_training=True, reuse=False, num_batch=None,
-               use_batch_norm=True, *kwargs) -> tf.Tensor:
-  batch_norm_fn = None
-  if use_batch_norm:
-    batch_norm_fn = functools.partial(slim.batch_norm,
-                                      scale=True,
-                                      updates_collections=None,
-                                      is_training=is_training)
-  weights_initializer = tf.initializers.orthogonal(np.sqrt(2))
-
-  assert hidden.shape.as_list() == [num_batch, 1024]
-  relu = tf.nn.relu
-  with tf.variable_scope('decode', reuse=reuse):
-    x = relu(linear(hidden, 'fc1', n_hidden=2048, init_scale=np.sqrt(2)))
-    action_embedding = tf.layers.dense(action_ph, 2048,
-                                       activation=None,
-                                       kernel_initializer=weights_initializer,
-                                       bias_initializer=tf.constant_initializer(0.),
-                                       name='embedding_action')
-    x = tf.multiply(x=action_embedding, y=x, name='action_mul_feature')
-    assert x.shape.as_list() == [num_batch, 2048], x.shape
-
-    x = relu(linear(x, 'fc2', n_hidden=1024, init_scale=np.sqrt(2)))
-    assert x.shape.as_list() == [num_batch, 1024], x.shape
-
-    x = relu(linear(x, 'fc3', n_hidden=6400, init_scale=np.sqrt(2)))
-    assert x.shape.as_list() == [num_batch, 6400], x.shape
-
-    x = tf.reshape(x, (-1, 10, 10, 64))
-    assert x.shape.as_list() == [num_batch, 10, 10, 64], x.shape
-
-    x = slim.conv2d_transpose(x, 64, 6, 2,
-                              'same',
-                              activation_fn=tf.nn.relu,
-                              normalizer_fn=batch_norm_fn,
-                              weights_initializer=weights_initializer,
-                              scope='conv_transpose1')
-    assert x.shape.as_list() == [num_batch, 20, 20, 64], x.shape
-
-    x = slim.conv2d_transpose(x, 64, 6, 2,
-                              'same',
-                              activation_fn=tf.nn.relu,
-                              normalizer_fn=batch_norm_fn,
-                              weights_initializer=weights_initializer,
-                              scope='conv_transpose2')
-    assert x.shape.as_list() == [num_batch, 40, 40, 64], x.shape
-
-    x = slim.conv2d_transpose(x, 4, 6, 2,
-                              'valid',
-                              activation_fn=tf.nn.sigmoid,
-                              normalizer_fn=None,
-                              weights_initializer=weights_initializer,
-                              scope='conv_transpose3')
-    assert x.shape.as_list() == [num_batch, 84, 84, 4], x.shape
-  return x
+def decode_cnn(hidden: tf.Tensor, **kwargs) -> tf.Tensor:
+    assert hidden.shape.as_list() == [None, 1024]
+    relu = tf.nn.relu
+    layer_1 = relu(linear(hidden, 'fc1', n_hidden=2048, init_scale=np.sqrt(2)))  # None, 2048
+    # assert layer_2.shape.as_list() == [None, 20, 20, 64], layer_2.shape
+    # <Multiply action>
+    layer_2 = relu(linear(layer_1, 'fc2', n_hidden=1024, init_scale=np.sqrt(2)))  # None, 1024
+    # assert layer_2.shape.as_list() == [None, 20, 20, 64], layer_2.shape
+    layer_3 = relu(linear(layer_2, 'fc3', n_hidden=6400, init_scale=np.sqrt(2)))  # None, 6400
+    # assert layer_2.shape.as_list() == [None, 20, 20, 64], layer_2.shape
+    layer_3 = tf.reshape(layer_3, (-1, 10, 10, 64))  # None, 10, 10, 64
+    # assert layer_2.shape.as_list() == [None, 20, 20, 64], layer_2.shape
+    dconv1 = dconv_bn_relu(layer_3, 'dconv1', n_filters=64,
+                           filter_size=6, stride=2, pad='same')  # None, 20, 20, 64
+    assert dconv1.shape.as_list() == [None, 20, 20, 64], dconv1.shape
+    dconv2 = dconv_bn_relu(dconv1, 'dconv2', n_filters=64,
+                           filter_size=6, stride=2, pad='same')  # None, 40, 40, 64
+    assert dconv2.shape.as_list() == [None, 40, 40, 64], dconv2.shape
+    dconv3 = tf.tanh(dconv(dconv2, 'dconv3', n_filters=4,
+                           filter_size=6, stride=2, pad='valid'))  # None, 84, 84, 4
+    assert dconv3.shape.as_list() == [None, 84, 84, 4]
+    return dconv3

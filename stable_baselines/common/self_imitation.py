@@ -4,7 +4,7 @@ import random
 from gym import spaces
 
 from stable_baselines.common.segment_tree import SumSegmentTree, MinSegmentTree
-from stable_baselines.a2c.utils import discount_with_dones
+from stable_baselines.a2c_sil.utils import discount_with_dones
 
 
 class ReplayBuffer(object):
