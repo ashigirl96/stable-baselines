@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.ops import math_ops
 from gym import spaces
+from typing import Tuple
 
 from stable_baselines.a2c.utils import linear
 
@@ -95,7 +96,8 @@ class ProbabilityDistributionType(object):
         """
         return self.probability_distribution_class()(flat)
 
-    def proba_distribution_from_latent(self, pi_latent_vector, vf_latent_vector, init_scale=1.0, init_bias=0.0):
+    def proba_distribution_from_latent(self, pi_latent_vector, vf_latent_vector, init_scale=1.0, init_bias=0.0)\
+            -> Tuple[ProbabilityDistribution, tf.Tensor, tf.Tensor]:
         """
         returns the probability distribution from latent values
 
@@ -230,7 +232,8 @@ class DiagGaussianProbabilityDistributionType(ProbabilityDistributionType):
         """
         return self.probability_distribution_class()(flat)
 
-    def proba_distribution_from_latent(self, pi_latent_vector, vf_latent_vector, init_scale=1.0, init_bias=0.0):
+    def proba_distribution_from_latent(self, pi_latent_vector, vf_latent_vector, init_scale=1.0, init_bias=0.0)\
+            -> Tuple[ProbabilityDistribution, tf.Tensor, tf.Tensor]:
         mean = linear(pi_latent_vector, 'pi', self.size, init_scale=init_scale, init_bias=init_bias)
         logstd = tf.get_variable(name='pi/logstd', shape=[1, self.size], initializer=tf.zeros_initializer())
         pdparam = tf.concat([mean, mean * 0.0 + logstd], axis=1)
@@ -464,7 +467,7 @@ class BernoulliProbabilityDistribution(ProbabilityDistribution):
         return cls(flat)
 
 
-def make_proba_dist_type(ac_space):
+def make_proba_dist_type(ac_space) -> ProbabilityDistributionType:
     """
     return an instance of ProbabilityDistributionType for the correct type of action space
 

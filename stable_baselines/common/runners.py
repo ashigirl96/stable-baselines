@@ -1,5 +1,7 @@
 import numpy as np
 from abc import ABC, abstractmethod
+from stable_baselines.common.vec_env.vec_frame_stack import VecFrameStack
+from stable_baselines.common.base_class import BaseRLModel
 
 
 class AbstractEnvRunner(ABC):
@@ -11,8 +13,8 @@ class AbstractEnvRunner(ABC):
         :param model: (Model) The model to learn
         :param n_steps: (int) The number of steps to run for each environment
         """
-        self.env = env
-        self.model = model
+        self.env: VecFrameStack = env
+        self.model: BaseRLModel = model
         n_env = env.num_envs
         self.batch_ob_shape = (n_env*n_steps,) + env.observation_space.shape
         self.obs = np.zeros((n_env,) + env.observation_space.shape, dtype=env.observation_space.dtype.name)
