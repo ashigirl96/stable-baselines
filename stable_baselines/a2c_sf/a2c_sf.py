@@ -44,7 +44,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
   """
 
   def __init__(self, policy: Policies, env, gamma=0.99, n_steps=5,
-               vf_coef=0.25, ent_coef=0.01, recons_coef=1., sf_coef=0.01,
+               vf_coef=0.25, ent_coef=0.01, recons_coef=1., sf_coef=2.,
                max_grad_norm=0.5, learning_rate=7e-4, alpha=0.99, epsilon=1e-5, lr_schedule='linear', verbose=0,
                tensorboard_log=None,
                _init_setup_model=True, sil_update=4, sil_beta=0):
@@ -91,7 +91,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
     self.learning_rate_schedule = None
     self.summary = None
     self.episode_reward = None
-    self.saver: tf.train.Saver = None
+    self.save_directory: Path = None
 
     # if we are loading, it is possible the environment is not known, however the obs and action space are known
     if _init_setup_model:
@@ -157,8 +157,8 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
           loss = self.pg_loss - \
                  self.entropy * self.ent_coef + \
                  self.vf_loss * self.vf_coef + \
-                 self.recons_loss * self.recons_coef + \
-                 self.sf_loss * self.sf_coef
+                 self.sf_loss * self.sf_coef + \
+                 self.recons_loss * self.recons_coef
 
           tf.summary.scalar('recons_loss/max', tf.reduce_max(recons_losses))
           tf.summary.scalar('recons_loss/min', tf.reduce_min(recons_losses))
@@ -284,6 +284,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
     with SetVerbosity(self.verbose), \
          TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name) as writer:  # type: tf.summary.FileWriter
       self._setup_learn(seed)
+      self.save_directory = Path(writer.get_logdir())
 
       self.learning_rate_schedule = Scheduler(initial_value=self.learning_rate, n_values=total_timesteps,
                                               schedule=self.lr_schedule)
@@ -328,9 +329,6 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
             logger.record_tabular("sil_valid_samples", float(sil_samples))
             logger.record_tabular("sil_steps", float(self.sil.num_steps()))
           logger.dump_tabular()
-
-        if update % (log_interval * 20) == 0:
-          self.save(writer.get_logdir())
 
     return self
 
