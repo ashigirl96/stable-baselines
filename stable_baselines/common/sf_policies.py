@@ -11,6 +11,7 @@ ObservSpace = Union[Discrete, Box]
 ActionSpace = Union[Discrete, Box]
 FEATURE_SIZE = 1024
 
+
 def sf_cnn(scaled_images, **kwargs) -> tf.Tensor:
   """
   CNN from Nature paper.
@@ -25,6 +26,7 @@ def sf_cnn(scaled_images, **kwargs) -> tf.Tensor:
   layer_3 = activ(conv(layer_2, 'c3', n_filters=64, filter_size=3, stride=1, init_scale=np.sqrt(2), **kwargs))
   layer_3 = conv_to_fc(layer_3)
   return activ(linear(layer_3, 'fc1', n_hidden=FEATURE_SIZE, init_scale=np.sqrt(2)))
+
 
 def reconstruct(extracted_features: tf.Tensor,
                 scope: str,
@@ -173,6 +175,7 @@ class FeedForwardPolicy(ActorCriticPolicy):
     self.value_fn = value_fn
     self.recons_mod = recons_mod
     self.successor_feature = successor_feature
+    self.reward_bonus = tf.math.reciprocal(tf.linalg.norm(self.successor_feature, 2, axis=1))
     self._feature = extracted_features
     self.initial_state = None
     self._setup_init()
@@ -187,16 +190,16 @@ class FeedForwardPolicy(ActorCriticPolicy):
     return action, value, self.initial_state, neglogp
 
   def step_with_sf(self, observ, state=None, mask=None, deterministic=False) \
-      -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+      -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if deterministic:
-      action, value, neglogp, feature = self.sess.run(
-        [self.deterministic_action, self._value, self.neglogp, self._feature],
+      action, value, neglogp, feature, reward_bonus = self.sess.run(
+        [self.deterministic_action, self._value, self.neglogp, self._feature, self.reward_bonus],
         {self.obs_ph: observ})
     else:
-      action, value, neglogp, feature = self.sess.run(
-        [self.action, self._value, self.neglogp, self._feature],
+      action, value, neglogp, feature, reward_bonus = self.sess.run(
+        [self.action, self._value, self.neglogp, self._feature, self.reward_bonus],
         {self.obs_ph: observ})
-    return action, value, self.initial_state, neglogp, feature
+    return action, value, self.initial_state, neglogp, feature, reward_bonus
 
   def proba_step(self, obs, state=None, mask=None):
     return self.sess.run(self.policy_proba, {self.obs_ph: obs})

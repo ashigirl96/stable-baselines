@@ -228,7 +228,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
         self.summary = tf.summary.merge_all()
 
   def _train_step(self, obs, states, rewards, masks, actions, values, update,
-                  writer: tf.summary.FileWriter = None, features=None):
+                  writer: tf.summary.FileWriter = None, features=None, rewards_bonuses=None):
     """
     applies a training step to the model
 
@@ -249,7 +249,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
     assert cur_lr is not None, "Error: the observation input array cannon be empty"
 
     td_map = {self.train_model.obs_ph: obs, self.actions_ph: actions, self.advs_ph: advs,
-              self.rewards_ph: rewards, self.learning_rate_ph: cur_lr,
+              self.rewards_ph: rewards + rewards_bonuses, self.learning_rate_ph: cur_lr,
               self.successor_feature_ph: features}
     if states is not None:
       td_map[self.train_model.states_ph] = states
@@ -295,9 +295,9 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
       t_start = time.time()
       for update in range(1, total_timesteps // self.n_batch + 1):
         # true_reward is the reward without discount
-        obs, states, rewards, masks, actions, values, true_reward, raw_rewards, features = runner.run()
+        obs, states, rewards, masks, actions, values, true_reward, raw_rewards, features, reward_bonuses = runner.run()
         _, value_loss, policy_entropy, sf_loss = self._train_step(obs, states, rewards, masks, actions, values, update,
-                                                                  writer, features=features)
+                                                                  writer, features=features, rewards_bonuses=reward_bonuses)
         sil_loss, sil_adv, sil_samples, sil_nlogp = self._train_sil()
         n_seconds = time.time() - t_start
         fps = int((update * self.n_batch) / n_seconds)
@@ -388,14 +388,16 @@ class SuccessorFeatureA2CRunner(AbstractEnvRunner):
     # TODO: add
     mb_raw_rewards = []
     mb_features = []
+    mb_reward_bonuses = []
     mb_states = self.states
     for _ in range(self.n_steps):
-      actions, values, states, _, features = self.model.step(self.obs, self.states, self.dones)
+      actions, values, states, _, features, reward_bonuses = self.model.step(self.obs, self.states, self.dones)
       mb_obs.append(np.copy(self.obs))
       mb_actions.append(actions)
       mb_values.append(values)
       mb_features.append(features)
       mb_dones.append(self.dones)
+      mb_reward_bonuses.append(reward_bonuses)
       clipped_actions = actions
       # Clip the actions to avoid out of bound error
       if isinstance(self.env.action_space, gym.spaces.Box):
@@ -421,6 +423,8 @@ class SuccessorFeatureA2CRunner(AbstractEnvRunner):
     # TODO: Add MB Features (not Successor Features)
     mb_features = np.asarray(mb_features, dtype=np.float32).swapaxes(1, 0)  # (16, 5, FEATURE_SIZE)
     assert mb_features.shape == (16, 5, FEATURE_SIZE), mb_features.shape
+    mb_reward_bonuses = np.asarray(mb_reward_bonuses, dtype=np.float32).swapaxes(1, 0)
+    assert mb_reward_bonuses.shape == mb_rewards.shape, mb_reward_bonuses.shape
     mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(0, 1)
     mb_raw_rewards = np.asarray(mb_raw_rewards, dtype=np.float32).swapaxes(0, 1)
     mb_masks = mb_dones[:, :-1]
@@ -452,10 +456,11 @@ class SuccessorFeatureA2CRunner(AbstractEnvRunner):
 
     # convert from [n_env, n_steps, ...] to [n_steps * n_env, ...]
     mb_rewards = mb_rewards.reshape(-1, *mb_rewards.shape[2:])
+    mb_reward_bonuses = mb_reward_bonuses.reshape(-1, *mb_reward_bonuses.shape[2:])
     mb_raw_rewards = mb_raw_rewards.reshape(-1, *mb_raw_rewards.shape[2:])
     mb_actions = mb_actions.reshape(-1, *mb_actions.shape[2:])
     mb_values = mb_values.reshape(-1, *mb_values.shape[2:])
     mb_masks = mb_masks.reshape(-1, *mb_masks.shape[2:])
     mb_features = mb_features.reshape(self.batch_sf_shape)
     return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values, true_rewards, \
-           mb_raw_rewards, mb_features
+           mb_raw_rewards, mb_features, mb_reward_bonuses
