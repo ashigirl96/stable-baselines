@@ -44,9 +44,9 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
   """
 
   def __init__(self, policy: Policies, env, gamma=0.99, n_steps=5,
-               vf_coef=0.25, ent_coef=0.01, recons_coef=1., sf_coef=2.,
+               vf_coef=0.25, ent_coef=0.01, recons_coef=1., sf_coef=2., recons_intri=1.,
                max_grad_norm=0.5, learning_rate=7e-4, alpha=0.99, epsilon=1e-5, lr_schedule='linear', verbose=0,
-               tensorboard_log=None,
+               tensorboard_log=None, use_sf=True, use_recons=False,
                _init_setup_model=True, sil_update=4, sil_beta=0):
     self.policy: Policies = None
     super(SuccessorFeatureA2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
@@ -61,6 +61,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
     self.ent_coef = ent_coef
     self.recons_coef = recons_coef
     self.sf_coef = sf_coef
+
     self.max_grad_norm = max_grad_norm
     self.alpha = alpha
     self.epsilon = epsilon
@@ -92,6 +93,9 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
     self.summary = None
     self.episode_reward = None
     self.save_directory: Path = None
+    self.use_sf = use_sf
+    self.recons_intri = recons_intri
+    self.use_recons = use_recons
 
     # if we are loading, it is possible the environment is not known, however the obs and action space are known
     if _init_setup_model:
@@ -146,20 +150,27 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
           last_frame = tf.reshape(train_model.obs_ph[..., 3], shape=[-1, 84 * 84])
           recons_losses = tf.squared_difference(x=last_frame,
                                                 y=train_model.recons_mod)
+
           self.recons_loss = tf.losses.mean_squared_error(labels=last_frame,
                                                           predictions=train_model.recons_mod)
           self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
           self.pg_loss = tf.reduce_mean(self.advs_ph * neglogpac)
-          self.vf_loss = mse(tf.squeeze(train_model.value_fn), self.rewards_ph)
+          if self.use_recons:
+            self.vf_loss = mse(tf.squeeze(train_model.value_fn),
+                               self.rewards_ph + self.recons_intri * tf.stop_gradient(self.recons_loss))
+          else:
+            self.vf_loss = mse(tf.squeeze(train_model.value_fn), self.rewards_ph)
           # TODO: loss of SF
           self.sf_loss = tf.reduce_mean(mse(tf.squeeze(train_model.successor_feature),
                                             self.successor_feature_ph))
           loss = self.pg_loss - \
                  self.entropy * self.ent_coef + \
-                 self.vf_loss * self.vf_coef + \
-                 self.sf_loss * self.sf_coef + \
-                 self.recons_loss * self.recons_coef
-
+                 self.vf_loss * self.vf_coef
+          if self.use_recons:
+            loss += self.recons_loss * self.recons_coef
+          elif self.use_sf:
+            loss += self.sf_loss * self.sf_coef + \
+              self.recons_loss * self.recons_coef
           tf.summary.scalar('recons_loss/max', tf.reduce_max(recons_losses))
           tf.summary.scalar('recons_loss/min', tf.reduce_min(recons_losses))
           tf.summary.scalar('recons_loss', self.recons_loss)
@@ -218,6 +229,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
         self.step_model = step_model
         # self.step = step_model.step
         self.step = step_model.step_with_sf
+        self.estimate_recons = step_model.estimate_recons
         self.proba_step = step_model.proba_step
         self.value = step_model.value
         # TODO: Add
@@ -248,6 +260,7 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
       cur_lr = self.learning_rate_schedule.value()
     assert cur_lr is not None, "Error: the observation input array cannon be empty"
 
+    rewards_bonuses = rewards_bonuses if self.use_sf else np.zeros_like(rewards_bonuses)
     td_map = {self.train_model.obs_ph: obs, self.actions_ph: actions, self.advs_ph: advs,
               self.rewards_ph: rewards + rewards_bonuses, self.learning_rate_ph: cur_lr,
               self.successor_feature_ph: features}
@@ -297,7 +310,8 @@ class SuccessorFeatureA2C(ActorCriticRLModel):
         # true_reward is the reward without discount
         obs, states, rewards, masks, actions, values, true_reward, raw_rewards, features, reward_bonuses = runner.run()
         _, value_loss, policy_entropy, sf_loss = self._train_step(obs, states, rewards, masks, actions, values, update,
-                                                                  writer, features=features, rewards_bonuses=reward_bonuses)
+                                                                  writer, features=features,
+                                                                  rewards_bonuses=reward_bonuses)
         sil_loss, sil_adv, sil_samples, sil_nlogp = self._train_sil()
         n_seconds = time.time() - t_start
         fps = int((update * self.n_batch) / n_seconds)

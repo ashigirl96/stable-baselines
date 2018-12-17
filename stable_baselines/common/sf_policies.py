@@ -210,9 +210,9 @@ class FeedForwardPolicy(ActorCriticPolicy):
   def estimate_recons(self, observ, action):
     return self.sess.run(self.recons_mod, {self.obs_ph: observ,
                                            self.action_ph: action})
-
   def estimate_sf(self, observ):
     return self.sess.run(self.successor_feature, {self.obs_ph: observ})
+
 
 
 class CnnPolicy(FeedForwardPolicy):
