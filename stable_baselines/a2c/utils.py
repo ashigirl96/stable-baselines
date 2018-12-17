@@ -129,7 +129,7 @@ def conv(input_tensor, scope, *, n_filters, filter_size, stride,
         return bias + tf.nn.conv2d(input_tensor, weight, strides=strides, padding=pad, data_format=data_format)
 
 
-def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
+def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0) -> tf.Tensor:
     """
     Creates a fully connected layer for TensorFlow
 

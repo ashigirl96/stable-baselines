@@ -5,11 +5,30 @@ Changelog
 
 For download links, please look at `Github release page <https://github.com/hill-a/stable-baselines/releases>`_.
 
-Pre-Release 2.1.2a (WIP)
------------------------
+Pre-Release 2.2.2a (WIP)
+--------------------------
+
+- added support for storing model in file like object. (thanks to @erniejunior)
+
+
+Release 2.2.1 (2018-11-18)
+--------------------------
+
+- added VecVideoRecorder to record mp4 videos from environment.
+
+
+Release 2.2.0 (2018-11-07)
+--------------------------
+
+- Hotfix for ppo2, the wrong placeholder was used for the value function
+
+
+Release 2.1.2 (2018-11-06)
+--------------------------
 
 - added ``async_eigen_decomp`` parameter for ACKTR and set it to ``False`` by default (remove deprecation warnings)
 - added methods for calling env methods/setting attributes inside a VecEnv (thanks to @bjmuld)
+- updated gym minimum version
 
 
 Release 2.1.1 (2018-10-20)
@@ -158,3 +177,19 @@ Release 0.1.6 (2018-07-27)
 
 Missing: tests for acktr continuous (+ HER, gail but they rely on
 mujoco...)
+
+Maintainers
+-----------
+
+Stable-Baselines is currently maintained by `Ashley Hill`_ (aka @hill-a)
+and `Antonin Raffin`_ (aka `@araffin`_).
+
+.. _Ashley Hill: https://github.com/hill-a
+.. _Antonin Raffin: https://araffin.github.io/
+.. _@araffin: https://github.com/araffin
+
+Contributors (since v2.0.0):
+----------------------------
+In random order...
+
+Thanks to @bjmuld @iambenzo @iandanforth @r7vme @brendenpetersen @huvar @erniejunior

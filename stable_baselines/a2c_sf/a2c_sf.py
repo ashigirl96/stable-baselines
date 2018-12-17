@@ -4,20 +4,22 @@ import gym
 import numpy as np
 import tensorflow as tf
 from typing import Union, Type
+from pathlib import Path
 
 from stable_baselines import logger
-from stable_baselines.common import explained_variance, tf_util, ActorCriticRLModel, SetVerbosity, TensorboardWriter
-from stable_baselines.common.policies import LstmPolicy, ActorCriticPolicy, CnnLnLstmPolicy, CnnLstmPolicy, CnnPolicy
-from stable_baselines.common.runners import AbstractEnvRunner
-from stable_baselines.a2c.utils import discount_with_dones, Scheduler, find_trainable_variables, mse, \
-  total_episode_reward_logger
-
 from stable_baselines.common.self_imitation import SelfImitation
+from stable_baselines.common import explained_variance, tf_util, ActorCriticRLModel, SetVerbosity, TensorboardWriter
+from stable_baselines.common.policies import LstmPolicy, ActorCriticPolicy, CnnLnLstmPolicy, CnnLstmPolicy
+from stable_baselines.common.sf_policies import CnnPolicy, FeedForwardPolicy, FEATURE_SIZE
+from stable_baselines.common.runners import AbstractEnvRunner
+from stable_baselines.a2c_sf.utility import discounts_with_dones
+from stable_baselines.a2c.utils import Scheduler, find_trainable_variables, mse, \
+  total_episode_reward_logger
 
 Policies = Type[Union[CnnPolicy, CnnLstmPolicy, CnnLnLstmPolicy]]
 
 
-class SelfImitationA2C(ActorCriticRLModel):
+class SuccessorFeatureA2C(ActorCriticRLModel):
   """
   The SelfImitationA2C (Advantage Actor Critic) model class, https://arxiv.org/abs/1602.01783
 
@@ -41,13 +43,14 @@ class SelfImitationA2C(ActorCriticRLModel):
                             (used only for loading)
   """
 
-  def __init__(self, policy: Policies, env, gamma=0.99, n_steps=5, vf_coef=0.25, ent_coef=0.01,
-               max_grad_norm=0.5,
-               learning_rate=7e-4, alpha=0.99, epsilon=1e-5, lr_schedule='linear', verbose=0, tensorboard_log=None,
+  def __init__(self, policy: Policies, env, gamma=0.99, n_steps=5,
+               vf_coef=0.25, ent_coef=0.01, recons_coef=1., sf_coef=2., recons_intri=1.,
+               max_grad_norm=0.5, learning_rate=7e-4, alpha=0.99, epsilon=1e-5, lr_schedule='linear', verbose=0,
+               tensorboard_log=None, use_sf=True, use_recons=False,
                _init_setup_model=True, sil_update=4, sil_beta=0):
     self.policy: Policies = None
-    super(SelfImitationA2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
-                                           _init_setup_model=_init_setup_model)
+    super(SuccessorFeatureA2C, self).__init__(policy=policy, env=env, verbose=verbose, requires_vec_env=True,
+                                              _init_setup_model=_init_setup_model)
 
     self.sil_update = sil_update
     self.sil_beta = sil_beta
@@ -56,6 +59,9 @@ class SelfImitationA2C(ActorCriticRLModel):
     self.gamma = gamma
     self.vf_coef = vf_coef
     self.ent_coef = ent_coef
+    self.recons_coef = recons_coef
+    self.sf_coef = sf_coef
+
     self.max_grad_norm = max_grad_norm
     self.alpha = alpha
     self.epsilon = epsilon
@@ -80,11 +86,16 @@ class SelfImitationA2C(ActorCriticRLModel):
     self.step = None
     self.proba_step = None
     self.value = None
+    # TODO: ADD
+    self.successor_feature = None
     self.initial_state = None
     self.learning_rate_schedule = None
     self.summary = None
     self.episode_reward = None
-    self.saver: tf.train.Saver = None
+    self.save_directory: Path = None
+    self.use_sf = use_sf
+    self.recons_intri = recons_intri
+    self.use_recons = use_recons
 
     # if we are loading, it is possible the environment is not known, however the obs and action space are known
     if _init_setup_model:
@@ -95,6 +106,8 @@ class SelfImitationA2C(ActorCriticRLModel):
 
       assert issubclass(self.policy, ActorCriticPolicy), "Error: the input policy for the A2C model must be an " \
                                                          "instance of common.policies.ActorCriticPolicy."
+      assert issubclass(self.policy, FeedForwardPolicy), "Error: the input policy for the A2C model must be an " \
+                                                         "instance of common.policies.FeedFowardPolicy."
 
       self.graph = tf.Graph()
       with self.graph.as_default():
@@ -130,17 +143,41 @@ class SelfImitationA2C(ActorCriticRLModel):
           self.actions_ph = train_model.action_ph
           self.advs_ph = tf.placeholder(tf.float32, [None], name="advs_ph")
           self.rewards_ph = tf.placeholder(tf.float32, [None], name="rewards_ph")
+          self.successor_feature_ph = tf.placeholder(tf.float32, [None, FEATURE_SIZE], name="successor_feature_ph")
           self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
 
           neglogpac = train_model.proba_distribution.neglogp(self.actions_ph)
+          last_frame = tf.reshape(train_model.obs_ph[..., 3], shape=[-1, 84 * 84])
+          recons_losses = tf.squared_difference(x=last_frame,
+                                                y=train_model.recons_mod)
+
+          self.recons_loss = tf.losses.mean_squared_error(labels=last_frame,
+                                                          predictions=train_model.recons_mod)
           self.entropy = tf.reduce_mean(train_model.proba_distribution.entropy())
           self.pg_loss = tf.reduce_mean(self.advs_ph * neglogpac)
-          self.vf_loss = mse(tf.squeeze(train_model.value_fn), self.rewards_ph)
-          loss = self.pg_loss - self.entropy * self.ent_coef + self.vf_loss * self.vf_coef
-
+          if self.use_recons:
+            self.vf_loss = mse(tf.squeeze(train_model.value_fn),
+                               self.rewards_ph + self.recons_intri * tf.stop_gradient(self.recons_loss))
+          else:
+            self.vf_loss = mse(tf.squeeze(train_model.value_fn), self.rewards_ph)
+          # TODO: loss of SF
+          self.sf_loss = tf.reduce_mean(mse(tf.squeeze(train_model.successor_feature),
+                                            self.successor_feature_ph))
+          loss = self.pg_loss - \
+                 self.entropy * self.ent_coef + \
+                 self.vf_loss * self.vf_coef
+          if self.use_recons:
+            loss += self.recons_loss * self.recons_coef
+          elif self.use_sf:
+            loss += self.sf_loss * self.sf_coef + \
+              self.recons_loss * self.recons_coef
+          tf.summary.scalar('recons_loss/max', tf.reduce_max(recons_losses))
+          tf.summary.scalar('recons_loss/min', tf.reduce_min(recons_losses))
+          tf.summary.scalar('recons_loss', self.recons_loss)
           tf.summary.scalar('entropy_loss', self.entropy)
           tf.summary.scalar('policy_gradient_loss', self.pg_loss)
           tf.summary.scalar('value_function_loss', self.vf_loss)
+          tf.summary.scalar('successor_feature_loss', self.sf_loss)
           tf.summary.scalar('loss', loss)
 
           self.params = find_trainable_variables("model")
@@ -149,6 +186,8 @@ class SelfImitationA2C(ActorCriticRLModel):
             grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
           grads = list(zip(grads, self.params))
 
+        _last_frame = tf.reshape(last_frame, [-1, 84, 84, 1])
+        _recons_mod = tf.reshape(train_model.recons_mod, [-1, 84, 84, 1])
         with tf.variable_scope("input_info", reuse=False):
           tf.summary.scalar('discounted_rewards', tf.reduce_mean(self.rewards_ph))
           tf.summary.histogram('discounted_rewards', self.rewards_ph)
@@ -156,6 +195,8 @@ class SelfImitationA2C(ActorCriticRLModel):
           tf.summary.histogram('learning_rate', self.learning_rate)
           tf.summary.scalar('advantage', tf.reduce_mean(self.advs_ph))
           tf.summary.histogram('advantage', self.advs_ph)
+          tf.summary.image('last_frame', _last_frame)
+          tf.summary.image('reconstruction', _recons_mod)
           if len(self.observation_space.shape) == 3:
             tf.summary.image('observation', train_model.obs_ph)
           else:
@@ -186,15 +227,20 @@ class SelfImitationA2C(ActorCriticRLModel):
 
         self.train_model = train_model
         self.step_model = step_model
-        self.step = step_model.step
+        # self.step = step_model.step
+        self.step = step_model.step_with_sf
+        self.estimate_recons = step_model.estimate_recons
         self.proba_step = step_model.proba_step
         self.value = step_model.value
+        # TODO: Add
+        self.successor_feature = step_model.estimate_sf
         self.initial_state = step_model.initial_state
         tf.global_variables_initializer().run(session=self.sess)
 
         self.summary = tf.summary.merge_all()
 
-  def _train_step(self, obs, states, rewards, masks, actions, values, update, writer: tf.summary.FileWriter = None):
+  def _train_step(self, obs, states, rewards, masks, actions, values, update,
+                  writer: tf.summary.FileWriter = None, features=None, rewards_bonuses=None):
     """
     applies a training step to the model
 
@@ -214,8 +260,10 @@ class SelfImitationA2C(ActorCriticRLModel):
       cur_lr = self.learning_rate_schedule.value()
     assert cur_lr is not None, "Error: the observation input array cannon be empty"
 
+    rewards_bonuses = rewards_bonuses if self.use_sf else np.zeros_like(rewards_bonuses)
     td_map = {self.train_model.obs_ph: obs, self.actions_ph: actions, self.advs_ph: advs,
-              self.rewards_ph: rewards, self.learning_rate_ph: cur_lr}
+              self.rewards_ph: rewards + rewards_bonuses, self.learning_rate_ph: cur_lr,
+              self.successor_feature_ph: features}
     if states is not None:
       td_map[self.train_model.states_ph] = states
       td_map[self.train_model.masks_ph] = masks
@@ -225,20 +273,21 @@ class SelfImitationA2C(ActorCriticRLModel):
       if (1 + update) % 10 == 0:
         run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
         run_metadata = tf.RunMetadata()
-        summary, policy_loss, value_loss, policy_entropy, _ = self.sess.run(
-          [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.apply_backprop],
-          td_map, options=run_options, run_metadata=run_metadata)
+        summary, policy_loss, value_loss, policy_entropy, _, sf_loss = self.sess.run(
+          [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.apply_backprop,
+           self.sf_loss], td_map, options=run_options, run_metadata=run_metadata)
         writer.add_run_metadata(run_metadata, 'step%d' % (update * (self.n_batch + 1)))
       else:
-        summary, policy_loss, value_loss, policy_entropy, _ = self.sess.run(
-          [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.apply_backprop], td_map)
+        summary, policy_loss, value_loss, policy_entropy, _, sf_loss = self.sess.run(
+          [self.summary, self.pg_loss, self.vf_loss, self.entropy, self.apply_backprop,
+           self.sf_loss], td_map)
       writer.add_summary(summary, update * (self.n_batch + 1))
 
     else:
-      policy_loss, value_loss, policy_entropy, _ = self.sess.run(
-        [self.pg_loss, self.vf_loss, self.entropy, self.apply_backprop], td_map)
+      policy_loss, value_loss, policy_entropy, _, sf_loss = self.sess.run(
+        [self.pg_loss, self.vf_loss, self.entropy, self.apply_backprop, self.sf_loss], td_map)
 
-    return policy_loss, value_loss, policy_entropy
+    return policy_loss, value_loss, policy_entropy, sf_loss
 
   def _train_sil(self):
     cur_lr = self.learning_rate_schedule.value()
@@ -248,19 +297,21 @@ class SelfImitationA2C(ActorCriticRLModel):
     with SetVerbosity(self.verbose), \
          TensorboardWriter(self.graph, self.tensorboard_log, tb_log_name) as writer:  # type: tf.summary.FileWriter
       self._setup_learn(seed)
+      self.save_directory = Path(writer.get_logdir())
 
       self.learning_rate_schedule = Scheduler(initial_value=self.learning_rate, n_values=total_timesteps,
                                               schedule=self.lr_schedule)
 
-      runner = SelfImitationA2CRunner(self.env, self, n_steps=self.n_steps, gamma=self.gamma)
+      runner = SuccessorFeatureA2CRunner(self.env, self, n_steps=self.n_steps, gamma=self.gamma)
       self.episode_reward = np.zeros((self.n_envs,))
 
       t_start = time.time()
       for update in range(1, total_timesteps // self.n_batch + 1):
         # true_reward is the reward without discount
-        obs, states, rewards, masks, actions, values, true_reward, raw_rewards = runner.run()
-        _, value_loss, policy_entropy = self._train_step(obs, states, rewards, masks, actions, values, update,
-                                                         writer)
+        obs, states, rewards, masks, actions, values, true_reward, raw_rewards, features, reward_bonuses = runner.run()
+        _, value_loss, policy_entropy, sf_loss = self._train_step(obs, states, rewards, masks, actions, values, update,
+                                                                  writer, features=features,
+                                                                  rewards_bonuses=reward_bonuses)
         sil_loss, sil_adv, sil_samples, sil_nlogp = self._train_sil()
         n_seconds = time.time() - t_start
         fps = int((update * self.n_batch) / n_seconds)
@@ -284,6 +335,7 @@ class SelfImitationA2C(ActorCriticRLModel):
           logger.record_tabular("fps", fps)
           logger.record_tabular("policy_entropy", float(policy_entropy))
           logger.record_tabular("value_loss", float(value_loss))
+          logger.record_tabular('sf_loss', float(sf_loss))
           logger.record_tabular("explained_variance", float(explained_var))
           logger.record_tabular("best_episode_reward", float(self.sil.get_best_reward()))
           if self.sil_update > 0:
@@ -291,9 +343,6 @@ class SelfImitationA2C(ActorCriticRLModel):
             logger.record_tabular("sil_valid_samples", float(sil_samples))
             logger.record_tabular("sil_steps", float(self.sil.num_steps()))
           logger.dump_tabular()
-
-        if update % (log_interval * 20) == 0:
-          self.save(writer.get_logdir())
 
     return self
 
@@ -303,6 +352,8 @@ class SelfImitationA2C(ActorCriticRLModel):
       "n_steps": self.n_steps,
       "vf_coef": self.vf_coef,
       "ent_coef": self.ent_coef,
+      "recons_coef": self.recons_coef,
+      "sf_coef": self.sf_coef,
       "max_grad_norm": self.max_grad_norm,
       "learning_rate": self.learning_rate,
       "alpha": self.alpha,
@@ -320,14 +371,11 @@ class SelfImitationA2C(ActorCriticRLModel):
 
     self._save_to_file(save_path, data=data, params=params)
 
-  def load_weights(self, load_path):
-    pass
 
-
-class SelfImitationA2CRunner(AbstractEnvRunner):
+class SuccessorFeatureA2CRunner(AbstractEnvRunner):
   def __init__(self,
                env,
-               model: SelfImitationA2C,
+               model: SuccessorFeatureA2C,
                n_steps=5, gamma=0.99):
     """
     A runner to learn the policy of an environment for an a2c model
@@ -337,9 +385,11 @@ class SelfImitationA2CRunner(AbstractEnvRunner):
     :param n_steps: (int) The number of steps to run for each environment
     :param gamma: (float) Discount factor
     """
-    super(SelfImitationA2CRunner, self).__init__(env=env, model=model, n_steps=n_steps)
+    super(SuccessorFeatureA2CRunner, self).__init__(env=env, model=model, n_steps=n_steps)
     self.model = model
     self.gamma = gamma
+    feature_size = model.train_model.successor_feature.shape.as_list()[1]
+    self.batch_sf_shape = (env.num_envs * n_steps,) + (feature_size,)
 
   def run(self):
     """
@@ -351,13 +401,17 @@ class SelfImitationA2CRunner(AbstractEnvRunner):
     mb_obs, mb_rewards, mb_actions, mb_values, mb_dones = [], [], [], [], []
     # TODO: add
     mb_raw_rewards = []
+    mb_features = []
+    mb_reward_bonuses = []
     mb_states = self.states
     for _ in range(self.n_steps):
-      actions, values, states, _ = self.model.step(self.obs, self.states, self.dones)
+      actions, values, states, _, features, reward_bonuses = self.model.step(self.obs, self.states, self.dones)
       mb_obs.append(np.copy(self.obs))
       mb_actions.append(actions)
       mb_values.append(values)
+      mb_features.append(features)
       mb_dones.append(self.dones)
+      mb_reward_bonuses.append(reward_bonuses)
       clipped_actions = actions
       # Clip the actions to avoid out of bound error
       if isinstance(self.env.action_space, gym.spaces.Box):
@@ -380,25 +434,47 @@ class SelfImitationA2CRunner(AbstractEnvRunner):
     mb_rewards = np.asarray(mb_rewards, dtype=np.float32).swapaxes(0, 1)
     mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(0, 1)
     mb_values = np.asarray(mb_values, dtype=np.float32).swapaxes(0, 1)
+    # TODO: Add MB Features (not Successor Features)
+    mb_features = np.asarray(mb_features, dtype=np.float32).swapaxes(1, 0)  # (16, 5, FEATURE_SIZE)
+    assert mb_features.shape == (16, 5, FEATURE_SIZE), mb_features.shape
+    mb_reward_bonuses = np.asarray(mb_reward_bonuses, dtype=np.float32).swapaxes(1, 0)
+    assert mb_reward_bonuses.shape == mb_rewards.shape, mb_reward_bonuses.shape
     mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(0, 1)
     mb_raw_rewards = np.asarray(mb_raw_rewards, dtype=np.float32).swapaxes(0, 1)
     mb_masks = mb_dones[:, :-1]
     mb_dones = mb_dones[:, 1:]
     true_rewards = np.copy(mb_rewards)
-    last_values = self.model.value(self.obs, self.states, self.dones).tolist()
-    # discount/bootstrap off value fn
-    for n, (rewards, dones, value) in enumerate(zip(mb_rewards, mb_dones, last_values)):
+    last_values = self.model.value(self.obs, self.states, self.dones).tolist()  # (num_envs,)
+    # TODO: Last SF
+    last_sf = self.model.successor_feature(self.obs)  # (num_envs, FEATURE_SIZE)
+
+    # TODO: Calculate discount Feature Representation
+    for n, (rewards, dones, value, features, sf) in enumerate(
+        zip(mb_rewards, mb_dones, last_values, mb_features, last_sf)):
       rewards = rewards.tolist()
       dones = dones.tolist()
+      features = list(features)
+      # TODO: discount_with_dones Features
       if dones[-1] == 0:
-        rewards = discount_with_dones(rewards + [value], dones + [0], self.gamma)[:-1]
+        rewards, features = discounts_with_dones(rewards + [value],
+                                                 features + [sf],
+                                                 dones + [0], self.gamma)
+        rewards = rewards[:-1]
+        features = features[:-1]
       else:
-        rewards = discount_with_dones(rewards, dones, self.gamma)
+        rewards, features = discounts_with_dones(rewards,
+                                                 features,
+                                                 dones, self.gamma)
       mb_rewards[n] = rewards
+      mb_features[n] = features  # (16, 5, FEATURE_SIZE)
 
     # convert from [n_env, n_steps, ...] to [n_steps * n_env, ...]
     mb_rewards = mb_rewards.reshape(-1, *mb_rewards.shape[2:])
+    mb_reward_bonuses = mb_reward_bonuses.reshape(-1, *mb_reward_bonuses.shape[2:])
+    mb_raw_rewards = mb_raw_rewards.reshape(-1, *mb_raw_rewards.shape[2:])
     mb_actions = mb_actions.reshape(-1, *mb_actions.shape[2:])
     mb_values = mb_values.reshape(-1, *mb_values.shape[2:])
     mb_masks = mb_masks.reshape(-1, *mb_masks.shape[2:])
-    return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values, true_rewards, mb_raw_rewards
+    mb_features = mb_features.reshape(self.batch_sf_shape)
+    return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values, true_rewards, \
+           mb_raw_rewards, mb_features, mb_reward_bonuses
